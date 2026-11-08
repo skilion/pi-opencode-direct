@@ -58,5 +58,6 @@ newer Pi, bump the pinned `@earendil-works/pi-ai` entry in both `dependencies`
 and `devDependencies` to the new Pi version first. Run verification, review and
 commit the release, then publish. Each npm version can only be published once.
 
-Live verification is optional: `npm run test:live` sends two real free-tier
-requests. Regular verification uses fixtures and needs no model credentials.
+Live verification is optional: `npm run test:live` requires Bun and sends a
+few real free-tier requests. Regular verification uses fixtures and needs no
+model credentials.

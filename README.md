@@ -75,6 +75,21 @@ Requests use Pi's native retry handling (two retries by default) and a
 Muse Spark currently accepts only `tool_choice: auto`; normal Pi tool use does
 not require forced tool choice.
 
+Zen's anonymous free tier gates tool-bearing Chat Completions requests on
+OpenCode's `<env>...</env>` system-prompt frame and on the presence of
+OpenCode's `read` tool. The extension adds the frame only for anonymous
+requests; keyed requests are unchanged. Pi's normal coding tool set includes
+`read`, so interactive sessions match the gate. Requests that expose only
+custom tools (for example some background-review side-channels) still get
+`429 FreeUsageLimitError` from the free tier; use a keyed model for those.
+When Pi runs on Bun, Zen chat and catalogue requests use `Bun.fetch` instead
+of Pi's process-wide undici fetch, matching the OpenCode CLI's transport; an
+explicit caller-supplied `fetch` still wins. Pi hosted on Node has no
+`Bun.fetch`, so those hosts still need a Bun relay for the transport gate.
+The current OpenCode CLI (2.2.6) uses `/inference/openai/v1` and a newer user
+agent; this extension still uses `/inference/v1` and the 2.0.30 identity
+because the gate accepts them once the frame and `read` tool are present.
+
 ## Memory extensions (pi-hermes-memory)
 
 Background-review direct transport (`pi-ai/compat completeSimple`) bypasses
@@ -115,16 +130,17 @@ child with an absolute file path:
 npm ci --ignore-scripts
 npm run verify
 
-# Optional: sends real requests to Zen
+# Optional: sends a few real requests to Zen (requires Bun)
 npm run test:live
 ```
 
 `npm test` uses in-memory HTTP fixtures, with no network or model calls.
-`test:live` is opt-in and sends two small free-tier requests to verify images,
-xhigh reasoning, native streaming tool calls, and replay of a tool result.
+`test:live` is opt-in, requires Bun, and sends a few small free-tier requests
+to verify the anonymous chat gate, images, native streaming tool calls, and
+replay of a tool result.
 Use the free tier lightly and follow the provider's data-use policies.
 
-Validated with Pi 1.3.0 and OpenCode CLI 2.0.30: twenty-one automated tests; live chat with a
+Validated with Pi 1.3.0 and OpenCode CLI 2.2.6: the automated suite; live chat with a
 native tool-call/result round trip; and a Pi CLI session that used `read` on a
 PNG and correctly described it while OpenCode was absent from `PATH`.
 

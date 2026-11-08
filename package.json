@@ -24,7 +24,7 @@
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "check": "tsc --noEmit",
-    "test:live": "node --experimental-strip-types test/live.ts",
+    "test:live": "bun test/live.ts",
     "check:package": "npm pack --dry-run --ignore-scripts",
     "verify": "npm run check && npm test && npm run check:package",
     "prepublishOnly": "npm run verify"

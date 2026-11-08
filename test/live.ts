@@ -1,15 +1,31 @@
-/** Opt-in: sends two small requests to the public free tier; never run by npm test. */
+/** Opt-in: sends a few small requests to the public free tier; never run by npm test. */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { createModels, Type, type Context } from "@earendil-works/pi-ai";
 import { zenProvider, PROVIDER_ID } from "../src/provider.ts";
 
-const models = createModels(); models.setProvider(zenProvider());
+const provider = zenProvider();
+const models = createModels(); models.setProvider(provider);
 const refreshed = await models.refresh();
 assert.equal(refreshed.errors.size, 0, [...refreshed.errors.values()].join("; "));
-const model = models.getModel(PROVIDER_ID, "muse-spark-1.3-contributor-free")!;
-assert.ok(model);
+
+// Chat Completions gate check: needs the anonymous env frame and a `read` tool.
+const gateModel = models.getModel(PROVIDER_ID, "big-pickle");
+assert.ok(gateModel, "big-pickle missing from the live catalogue");
+const gateContext: Context = {
+  systemPrompt: "Use the read tool only if you need to inspect a file. Otherwise answer directly.",
+  messages: [{ role: "user", timestamp: Date.now(), content: "Reply with exactly: OK" }],
+  tools: [{ name: "read", description: "Read a file.", parameters: Type.Object({ path: Type.String() }) }],
+};
+const gate = await models.completeSimple(gateModel, gateContext, { sessionId: randomUUID(), maxTokens: 32, maxRetries: 0 });
+assert.notEqual(gate.stopReason, "error", gate.errorMessage);
+console.log(JSON.stringify({ check: "anonymous chat gate (env frame + read tool)", passed: true, stopReason: gate.stopReason }));
+
+const model = models.getModel(PROVIDER_ID, "muse-spark-1.3-contributor-free")
+  ?? models.getModel(PROVIDER_ID, "nemotron-3.5-super-vl-free")
+  ?? provider.getModels().find((m) => m.input.includes("image"));
+assert.ok(model, "no image-capable free model in the live catalogue");
 function crc32(data: Uint8Array): number {
   let crc = 0xffffffff;
   for (const byte of data) { crc ^= byte; for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0); }
@@ -30,9 +46,13 @@ const png = Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk("IHDR"
 const context: Context = {
   systemPrompt: "Use record_colors to record the colors visible in the image. After its result, reply with the receipt code only.",
   messages: [{ role: "user", timestamp: Date.now(), content: [{ type: "text", text: "Record the background and center-square colors in this image." }, { type: "image", data: png.toString("base64"), mimeType: "image/png" }] }],
-  tools: [{ name: "record_colors", description: "Record observed image colors and receive a receipt code.", parameters: Type.Object({ background: Type.String(), square: Type.String() }) }],
+  tools: [
+    // The anonymous Chat Completions gate expects a `read` tool; this task uses record_colors.
+    { name: "read", description: "Read a file. Not needed for this task.", parameters: Type.Object({ path: Type.String() }) },
+    { name: "record_colors", description: "Record observed image colors and receive a receipt code.", parameters: Type.Object({ background: Type.String(), square: Type.String() }) },
+  ],
 };
-const options = { sessionId: randomUUID(), reasoning: "xhigh" as const, maxTokens: 4096, maxRetries: 0 };
+const options = { sessionId: randomUUID(), ...(model.id.startsWith("muse-spark-") ? { reasoning: "xhigh" as const } : {}), maxTokens: 4096, maxRetries: 0 };
 const stream = models.streamSimple(model, context, options);
 const types = new Set<string>(); for await (const event of stream) types.add(event.type);
 const first = await stream.result();

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createModels, normalizeContext, Type, type Api, type Context, type FetchFunction, type Model } from "@earendil-works/pi-ai";
-import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, OPENCODE_USER_AGENT, STATIC_ZEN_HEADERS, BASE_URL, isEncryptedContentError, stripStaleReasoning } from "../src/provider.ts";
+import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, OPENCODE_USER_AGENT, OPENCODE_ENV_FRAME, STATIC_ZEN_HEADERS, BASE_URL, isEncryptedContentError, selectZenFetch, stripStaleReasoning, withEnvFrame } from "../src/provider.ts";
 
 const muse = (p = zenProvider()) => p.getModels().find(m => m.id === "muse-spark-1.3-contributor-free")!;
+/** OpenCode's chat gate expects a tool literally named `read`; Pi normally provides it. */
+const readTool = () => ({ name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) });
 /** Build a 0.86 TranscriptContext the way Pi core does before calling a Provider. */
 const toTranscript = (ctx: Context) => normalizeContext(ctx);
 const context = toTranscript({ messages: [{ role: "user" as const, content: "Test", timestamp: 1 }] });
@@ -20,6 +22,10 @@ function response(items: unknown[] = [text]) {
   }
   events.push({ type: "response.completed", response: { id: "resp_1", status: "completed", output: items, usage } });
   return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""), { headers: { "Content-Type": "text/event-stream" } });
+}
+
+function chatResponse() {
+  return new Response('data: {"id":"chat_1","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}\n\ndata: {"id":"chat_1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { "Content-Type": "text/event-stream" } });
 }
 
 function capture(items?: unknown[]) {
@@ -74,7 +80,69 @@ test("anonymous Responses requests preserve xhigh, images, and text-before-tool 
   assert.equal(request.headers.get("x-opencode-session"), sessionHeader("session-a"));
   assert.equal(request.body.reasoning.effort, "xhigh");
   assert.equal(request.body.tools[0].name, "lookup");
-  assert.ok(request.body.input.some((m: any) => m.content?.some((b: any) => b.type === "input_image")));
+  assert.ok(request.body.input.some((m: any) => Array.isArray(m.content) && m.content.some((b: any) => b.type === "input_image")));
+});
+
+test("anonymous chat requests include the OpenCode free-tier env frame", async () => {
+  const p = zenProvider();
+  let body: any;
+  const fetch: FetchFunction = async (_url, init) => {
+    body = JSON.parse(String(init?.body));
+    return chatResponse();
+  };
+  const model = p.getModels().find(m => m.id === "big-pickle")!;
+  const withSystem = toTranscript({ systemPrompt: "Test harness", tools: [readTool()], messages: [{ role: "user", content: "Test", timestamp: 2 }] });
+  await p.streamSimple(model, withSystem, { fetch, sessionId: "frame-a" }).result();
+  const system = body.messages.find((m: any) => m.role === "system");
+  const content = typeof system.content === "string" ? system.content : JSON.stringify(system.content);
+  assert.ok(content.includes(OPENCODE_ENV_FRAME), "system prompt is missing the env frame");
+});
+
+test("keyed chat requests skip the anonymous env frame", async () => {
+  const p = zenProvider();
+  let body: any;
+  const fetch: FetchFunction = async (_url, init) => {
+    body = JSON.parse(String(init?.body));
+    return chatResponse();
+  };
+  const model = p.getModels().find(m => m.id === "big-pickle")!;
+  const ctx = toTranscript({ systemPrompt: "Test harness", tools: [readTool()], messages: [{ role: "user", content: "Test", timestamp: 2 }] });
+  await p.streamSimple(model, ctx, { fetch, apiKey: "sk-zen-real", sessionId: "frame-key" }).result();
+  const system = body.messages.find((m: any) => m.role === "system");
+  const content = typeof system.content === "string" ? system.content : JSON.stringify(system.content);
+  assert.ok(!content.includes(OPENCODE_ENV_FRAME), "keyed request should not get the anonymous env frame");
+});
+
+test("withEnvFrame is idempotent and preserves any existing env block", () => {
+  const transcript = toTranscript({ systemPrompt: "System", messages: [{ role: "user", content: "Hi", timestamp: 2 }] });
+  const once = withEnvFrame(transcript);
+  const twice = withEnvFrame(once);
+  const system = (twice as any).messages.find((m: any) => m.role === "system");
+  const content = typeof system.content === "string" ? system.content : JSON.stringify(system.content);
+  assert.equal(content.split(OPENCODE_ENV_FRAME).length - 1, 1);
+
+  const existing = toTranscript({ systemPrompt: "<env>\n  Working directory: /project\n</env>\n\nSystem", messages: [{ role: "user", content: "Hi", timestamp: 2 }] });
+  const preserved = withEnvFrame(existing);
+  const preservedSystem = (preserved as any).messages.find((m: any) => m.role === "system");
+  const preservedContent = typeof preservedSystem.content === "string" ? preservedSystem.content : JSON.stringify(preservedSystem.content);
+  assert.ok(!preservedContent.includes(OPENCODE_ENV_FRAME), "existing env block should be left untouched");
+  assert.equal(preservedContent.split("<env>").length - 1, 1);
+});
+
+test("selectZenFetch prefers explicit fetch, then Bun's native fetch", () => {
+  const explicit = (async () => new Response()) as FetchFunction;
+  assert.equal(selectZenFetch(explicit), explicit);
+  const g = globalThis as { Bun?: { fetch?: unknown } };
+  const hadBun = Object.prototype.hasOwnProperty.call(g, "Bun");
+  const previous = g.Bun;
+  const bunFetch = (async () => new Response("bun")) as unknown as FetchFunction;
+  try {
+    g.Bun = { fetch: bunFetch };
+    assert.equal(selectZenFetch(), bunFetch);
+  } finally {
+    if (hadBun) g.Bun = previous;
+    else delete g.Bun;
+  }
 });
 
 test("explicitly resolved keys are honored instead of anonymous", async () => {

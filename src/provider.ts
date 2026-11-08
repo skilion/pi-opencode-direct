@@ -335,6 +335,83 @@ export async function resolveZenApiKey(input: {
   return { apiKey: "public", source: "Anonymous free tier" };
 }
 
+/**
+ * Zen's anonymous free tier requires this metadata frame in the system prompt
+ * for tool-bearing chat requests. The OpenCode CLI includes it in its harness
+ * prompt; Pi's own system prompt does not, and the gate answers 429
+ * FreeUsageLimitError even when headers, path, and tools match the CLI.
+ * The Chat Completions gate also expects OpenCode's `read` tool, which Pi's
+ * normal coding tool set provides. Keyed requests skip the frame entirely.
+ */
+export const OPENCODE_ENV_FRAME = "<env>Working directory: .</env>";
+
+/** Match any env block, not just the exact compact frame we add. */
+const ENV_FRAME_PATTERN = /<env>[\s\S]*?<\/env>/;
+
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => {
+    const text = (part as { text?: unknown } | null)?.text;
+    return typeof text === "string" ? text : "";
+  }).join("");
+}
+
+function hasEnvFrame(content: unknown): boolean {
+  return ENV_FRAME_PATTERN.test(contentText(content));
+}
+
+/** Compaction already sends OpenCode's byte-identical prompt; leave it untouched. */
+function isCompactionPrompt(content: unknown): boolean {
+  return contentText(content).includes(OPENCODE_SUMMARIZATION_PROMPT);
+}
+
+/** Add the OpenCode env frame to the leading system message, anonymously only. */
+export function withEnvFrame<T>(context: T, apiKey?: unknown): T {
+  const key = typeof apiKey === "string" && apiKey.trim() ? apiKey : "public";
+  if (key !== "public") return context;
+  if (!context || typeof context !== "object") return context;
+  const rec = context as Record<string, unknown>;
+  if (typeof rec.systemPrompt === "string") {
+    if (hasEnvFrame(rec.systemPrompt) || isCompactionPrompt(rec.systemPrompt)) return context;
+    return { ...rec, systemPrompt: `${OPENCODE_ENV_FRAME}\n\n${rec.systemPrompt}` } as T;
+  }
+  const msgs = rec.messages;
+  if (!Array.isArray(msgs)) return context;
+  let handled = false;
+  const next = msgs.map((m) => {
+    if (handled || !m || typeof m !== "object" || (m as { role?: unknown }).role !== "system") return m;
+    const content = (m as { content?: unknown }).content;
+    if (hasEnvFrame(content) || isCompactionPrompt(content)) {
+      handled = true;
+      return m;
+    }
+    if (typeof content === "string") {
+      handled = true;
+      return { ...(m as object), content: `${OPENCODE_ENV_FRAME}\n\n${content}` };
+    }
+    if (Array.isArray(content)) {
+      handled = true;
+      return { ...(m as object), content: [{ type: "text", text: `${OPENCODE_ENV_FRAME}\n\n` }, ...content] };
+    }
+    return m;
+  });
+  return { ...rec, messages: next } as T;
+}
+
+/**
+ * Pi installs undici as the process-wide fetch (core/http-dispatcher.js).
+ * Zen's free tier rejects that transport while accepting Bun's native fetch,
+ * which is what the OpenCode CLI uses. Prefer an explicit caller fetch (tests,
+ * embedding callers), then Bun.fetch when Pi itself runs on Bun, so the
+ * provider can opt out of undici without patching Pi internals.
+ */
+export function selectZenFetch(explicit?: FetchFunction): FetchFunction | undefined {
+  if (explicit) return explicit;
+  const bun = (globalThis as { Bun?: { fetch?: unknown } }).Bun?.fetch;
+  return typeof bun === "function" ? (bun as FetchFunction) : undefined;
+}
+
 function compatRequestOptions<T extends StreamOptions>(options: T, getSessionId: SessionGetter, fallbackSession: string): T {
   const headers = Object.fromEntries(Object.entries(options?.headers ?? {})
     .filter(([name]) => !["authorization", "user-agent", "x-opencode-session", "x-opencode-session-id", "x-session-affinity", "x-session-id", "x-opencode-client", "x-opencode-project", "x-opencode-request", "x-client-request-id"].includes(name.toLowerCase())));
@@ -355,7 +432,7 @@ function compatRequestOptions<T extends StreamOptions>(options: T, getSessionId:
     sessionId: opencodeSession,
     timeoutMs: options?.timeoutMs ?? 180_000,
     maxRetries: options?.maxRetries ?? 2,
-    fetch: withEncryptedContentFallback(options?.fetch as FetchFunction | undefined) as T["fetch"],
+    fetch: withEncryptedContentFallback(selectZenFetch(options?.fetch as FetchFunction | undefined)) as T["fetch"],
     headers: {
       ...headers,
       Authorization: `Bearer ${effectiveApiKey}`,
@@ -386,7 +463,8 @@ export function patchCompatDirectTransport(getSessionId: SessionGetter = () => u
       api: api as Parameters<typeof registerApiProvider>[0]["api"],
       stream: ((model: Model<Api>, context: never, options: StreamOptions) => {
         if ((model as Model<Api>).provider !== PROVIDER_ID) return origStream(model as never, context as never, options as never);
-        const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
+        const apiKey = (options as { apiKey?: unknown } | undefined)?.apiKey;
+        const ctx = withEnvFrame(swapCompactionPrompt(ensureTranscript(context), apiKey), apiKey);
         const processed = compatRequestOptions(options, getSessionId, fallbackSession);
         debugLog(`${identitySummary(new Headers(processed.headers as HeadersInit | undefined), "compat")} ${shapeSummary(ctx, options)}`);
         return origStream(model as never, ctx as never, processed as never);
@@ -394,7 +472,8 @@ export function patchCompatDirectTransport(getSessionId: SessionGetter = () => u
       streamSimple: ((model: Model<Api>, context: never, options: StreamOptions) => {
         if ((model as Model<Api>).provider !== PROVIDER_ID) return origStreamSimple(model as never, context as never, options as never);
         // No reasoning default here (see doc comment): compat omission means off.
-        const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
+        const apiKey = (options as { apiKey?: unknown } | undefined)?.apiKey;
+        const ctx = withEnvFrame(swapCompactionPrompt(ensureTranscript(context), apiKey), apiKey);
         const processed = compatRequestOptions(options, getSessionId, fallbackSession);
         debugLog(`${identitySummary(new Headers(processed.headers as HeadersInit | undefined), "compat")} ${shapeSummary(ctx, options)}`);
         return origStreamSimple(model as never, ctx as never, processed as never);
@@ -785,7 +864,8 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       }
       if (!ctx.allowNetwork || ctx.signal.aborted) return;
       const signal = ctx.signal;
-      const response = await fetch(`${BASE_URL}/models`, {
+      const fetchImpl = selectZenFetch() ?? globalThis.fetch;
+      const response = await fetchImpl(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
         headers: { "User-Agent": OPENCODE_USER_AGENT },
       });
@@ -803,11 +883,13 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       });
     },
     stream(model, context, options) {
-      const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
+      const apiKey = (options as { apiKey?: unknown } | undefined)?.apiKey;
+      const ctx = withEnvFrame(swapCompactionPrompt(ensureTranscript(context), apiKey), apiKey);
       return provider.stream(model, ctx, requestOptions(options, ctx));
     },
     streamSimple(model, context, options) {
-      const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
+      const apiKey = (options as { apiKey?: unknown } | undefined)?.apiKey;
+      const ctx = withEnvFrame(swapCompactionPrompt(ensureTranscript(context), apiKey), apiKey);
       return provider.streamSimple(model, ctx, {
         ...requestOptions(options, ctx),
         reasoning: options?.reasoning ?? (model.id.startsWith("muse-spark-") ? "xhigh" : undefined),

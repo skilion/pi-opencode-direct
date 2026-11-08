@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Recover anonymous free-tier chat requests rejected with
+  `429 FreeUsageLimitError` despite matching the CLI's headers, path, and
+  tools:
+  - Add OpenCode's `<env>` system-prompt frame for anonymous requests only;
+    keyed requests are left unchanged. Applies to the main provider and compat
+    side-channels, is idempotent, and preserves an existing env block.
+  - Prefer `Bun.fetch` over Pi's process-wide undici fetch for Zen chat and
+    catalogue requests. Pi installs undici in `core/http-dispatcher.js`; Zen's
+    free tier accepts Bun's native transport but rejects undici. An explicit
+    caller-supplied `fetch` still wins, so tests and embedding callers are
+    unchanged.
+  - The Chat Completions gate also expects a tool named `read`; Pi's normal
+    coding tool set provides it. Requests that expose only custom tools (for
+    example some background-review side-channels) still receive 429 and need a
+    keyed model.
+  - On Node-hosted Pi (no `Bun.fetch`), the env frame alone is not enough;
+    those hosts still need a Bun relay for the transport gate.
+  - Add keyed/anonymous frame tests plus an opt-in live gate check; the live
+    test now runs under Bun.
+
 ## 0.1.9
 
 - Auto-register unknown free Zen models (e.g. `step-5-preview-free`):
